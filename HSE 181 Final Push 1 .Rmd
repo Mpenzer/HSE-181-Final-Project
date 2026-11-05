@@ -1,0 +1,30 @@
+---
+title: "HSE 181 Final Project"
+author: "Max Penzer & Team"
+date: "2026-11-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+tarot_sim_data <- read_csv("DataWrangling_SimulationData - SimulatedData_Final.csv")
+
+head(tarot_sim_data)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
