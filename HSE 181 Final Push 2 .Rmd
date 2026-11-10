@@ -1,0 +1,269 @@
+---
+title: "HSE 181 Final Project"
+author: "Max Penzer & Team"
+date: "2026-11-05"
+output:
+  pdf_document:
+    latex_engine: xelatex
+geometry: margin=0.75in
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(knitr)
+
+#Use Personal Dartmouth API Key
+api_key <- Sys.getenv("DARTMOUTH_API_KEY")
+if (api_key == "") {
+  if (!interactive()) stop("No API key. Set DARTMOUTH_API_KEY in .Renviron before knitting.")
+  api_key <- rstudioapi::askForPassword("Dartmouth Chat API key")
+}
+base_url <- "https://chat.dartmouth.edu/api"
+```
+
+```{r load-data}
+#Loading the Data
+
+tarot_base_data <- read.csv("DataWrangling_SimulationData - Raw Data.csv",
+                            stringsAsFactors = FALSE)
+sim_file <- "DataWrangling_SimulationData - SimulatedData_Final.csv"
+```
+
+```{r api-helper}
+#An API Hellper to promp chat.dartmouth
+
+ask_dartmouth <- function(user_prompt, system_prompt = NULL,
+                          temperature = 0.3, max_tokens = NULL) {
+  msgs <- list()
+  if (!is.null(system_prompt)) {
+    msgs <- c(msgs, list(list(role = "system", content = system_prompt)))
+  }
+  msgs <- c(msgs, list(list(role = "user", content = user_prompt)))
+
+  body <- list(model = "google.gemma-4-31B-it",
+               messages = msgs,
+               temperature = temperature)
+  if (!is.null(max_tokens)) body$max_tokens <- max_tokens
+
+  res <- POST(paste0(base_url, "/chat/completions"),
+              add_headers(Authorization = paste("Bearer", api_key)),
+              body = body,
+              encode = "json",
+              timeout(120))
+
+  if (status_code(res) != 200) {
+    stop("API request failed with status ", status_code(res), ": ",
+         content(res, as = "text", encoding = "UTF-8"))
+  }
+
+  parsed <- fromJSON(content(res, as = "text", encoding = "UTF-8"),
+                     simplifyVector = FALSE)
+  choice <- parsed$choices[[1]]
+  msg    <- choice$message
+  out    <- msg$content
+  if (is.null(out) || !nzchar(trimws(out))) out <- msg$reasoning_content
+  if (is.null(out) || !nzchar(trimws(out))) {
+    stop("Empty reply. finish_reason = ", choice$finish_reason)
+  }
+  out
+}
+```
+
+```{r}
+#Training the Model on the simulated data 
+
+#Preparing the simulated dataframe 
+raw_lines <- readLines(sim_file, warn = FALSE, encoding = "UTF-8")
+raw_lines <- str_trim(raw_lines[-1])  
+raw_lines <- raw_lines[nzchar(raw_lines)]
+cat("Rows found:", length(raw_lines), "\n")
+
+clean_field <- function(x) str_trim(str_replace_all(x, '^"|"$', ""))
+
+parse_row <- function(line) {
+  f <- clean_field(str_split(line, ",")[[1]])
+  n <- length(f)
+  if (n < 13) return(NULL)                   
+  tibble(
+    card_number_1    = as.integer(f[1]),
+    reversed_1       = as.integer(f[2]),
+    card_number_2    = as.integer(f[3]),
+    reversed_2       = as.integer(f[4]),
+    card_number_3    = as.integer(f[5]),
+    reversed_3       = as.integer(f[6]),
+    card_name_1      = f[7],
+    card_name_2      = f[8],
+    card_name_3      = f[9],
+    reading          = paste(f[10:(n - 3)], collapse = ","),
+    top_sentiment    = f[n - 2],
+    second_sentiment = f[n - 1],
+    third_sentiment  = f[n]
+  )
+}
+
+tarot_all <- map_dfr(raw_lines, parse_row)
+
+fix_sentiment <- function(x) {
+  x <- str_to_title(str_trim(x))
+  x[x %in% c("", "Na", "Nan")] <- NA_character_
+  case_when(
+    x == "Negitive" ~ "Negative",
+    x == "Suprise"  ~ "Surprise",
+    TRUE            ~ x
+  )
+}
+
+tarot_all <- tarot_all %>%
+  mutate(
+    top_sentiment    = fix_sentiment(top_sentiment),
+    second_sentiment = fix_sentiment(second_sentiment),
+    third_sentiment  = fix_sentiment(third_sentiment)
+  )
+
+#Filtering out readings with an "unusable top sentiment" 
+bad <- is.na(tarot_all$top_sentiment) | !nzchar(tarot_all$reading)
+if (any(bad)) cat("Skipping", sum(bad), "incomplete reading(s).\n")
+tarot_train <- tarot_all[!bad, ]
+cat("Usable training readings:", nrow(tarot_train), "\n")
+stopifnot(nrow(tarot_train) > 0)
+
+label_set <- sort(unique(na.omit(c(tarot_train$top_sentiment,
+                                   tarot_train$second_sentiment,
+                                   tarot_train$third_sentiment))))
+
+#Generating a training example for the AI model
+training_examples <- tarot_train %>%
+  mutate(
+    o1 = if_else(reversed_1 == 1, "reversed", "upright"),
+    o2 = if_else(reversed_2 == 1, "reversed", "upright"),
+    o3 = if_else(reversed_3 == 1, "reversed", "upright"),
+    line = sprintf(
+      "Cards: %s (%s), %s (%s), %s (%s)\nReading: %s\nSentiments (ranked): %s > %s > %s",
+      card_name_1, o1, card_name_2, o2, card_name_3, o3,
+      reading, top_sentiment, second_sentiment, third_sentiment
+    )
+  ) %>%
+  pull(line) %>%
+  paste(collapse = "\n\n")
+
+#Sentiment counts associated with each card 
+card_evidence <- function(nm) {
+  hits <- tarot_train %>%
+    filter(str_to_lower(card_name_1) == str_to_lower(nm) |
+           str_to_lower(card_name_2) == str_to_lower(nm) |
+           str_to_lower(card_name_3) == str_to_lower(nm))
+  if (nrow(hits) == 0) return("no simulated readings include this card")
+  tally <- count(hits, top_sentiment, sort = TRUE)
+  paste0(nrow(hits), " reading(s). Top sentiments: ",
+         paste0(tally$top_sentiment, " (", tally$n, ")", collapse = ", "))
+}
+```
+
+```{r draw-and-reading, results = "asis"}
+#Card Draw and Reading- needs to be rerun for each reading 
+
+#Here We are selecting the Cards and their Orientations
+card_numbers    <- sample(0:77, 3, replace = FALSE)
+reverse_upright <- sample(0:1, 3, replace = TRUE)
+
+draw <- tibble(
+  position    = c("Past", "Present", "Future"),
+  card_number = card_numbers,
+  reversed    = reverse_upright
+) %>%
+  left_join(tarot_base_data, by = "card_number") %>%
+  mutate(
+    orientation = if_else(reversed == 1, "Reversed", "Upright"),
+    meaning     = if_else(reversed == 1, reversed_meaning, upright_meaning)
+  )
+
+stopifnot(nrow(draw) == 3, !any(is.na(draw$card_name)))
+
+#Sentiment prediction 
+drawn <- str_to_lower(draw$card_name)
+
+hits <- tarot_train %>%
+  filter(str_to_lower(card_name_1) %in% drawn |
+         str_to_lower(card_name_2) %in% drawn |
+         str_to_lower(card_name_3) %in% drawn)
+
+pooled <- c(hits$top_sentiment, hits$second_sentiment, hits$third_sentiment)
+pooled <- pooled[!is.na(pooled)]
+
+tally <- sort(table(pooled), decreasing = TRUE)
+ranked <- names(tally)
+if (length(ranked) < 3) ranked <- c(ranked, setdiff(label_set, ranked))
+predicted <- c(top = ranked[1], second = ranked[2], third = ranked[3])
+
+cat("Readings used for prediction:", nrow(hits), "\n")
+
+#Formulate the reading 
+spread_txt <- paste0(
+  draw$position, ": ", draw$card_name, " (", draw$orientation, "), meaning: ",
+  draw$meaning, collapse = "\n"
+)
+
+read_system <- paste0(
+  "You are a thoughtful tarot reader. Write only the reading itself, as plain prose ",
+  "in a single paragraph. Do not use labels, headings, bullet points, notes, drafts, ",
+  "or angle brackets. Do not mention sentiments, predictions, or the simulated data."
+)
+
+read_user <- paste0(
+  "Spread (Past, Present, Future):\n", spread_txt, "\n\n",
+  "Tone: the dominant feeling is ", predicted["top"],
+  ", with ", predicted["second"], " and ", predicted["third"],
+  " also present. Let the dominant feeling set the tone.\n\n",
+  "Write about 100 words. Name all three cards (",
+  paste(draw$card_name, collapse = ", "), "). ",
+  "Connect them in their positions, and use the upright or reversed meaning for each card as given."
+)
+
+looks_ok <- function(txt) {
+  txt <- str_trim(txt)
+  nzchar(txt) &&
+    !str_detect(txt, "[<>]|reading text|\\*|Draft|Let's|I will|I must") &&
+    str_count(txt, "\\S+") >= 60 &&
+    all(str_detect(str_to_lower(txt), fixed(str_to_lower(draw$card_name))))
+}
+
+final_reading <- NA_character_
+last_reply    <- ""
+for (attempt in 1:3) {
+  last_reply <- ask_dartmouth(read_user, read_system, temperature = 0.7, max_tokens = 800)
+  if (looks_ok(last_reply)) {
+    final_reading <- str_trim(last_reply)
+    break
+  }
+}
+if (is.na(final_reading)) {
+  stop("The model did not return a clean reading after 3 tries. Last reply:\n", last_reply)
+}
+
+#Printing the Output
+cat("# Tarot Reading\n\n")
+cat("**Card numbers:** ", paste(card_numbers, collapse = ", "), "  \n", sep = "")
+cat("**Orientation (0 = upright, 1 = reversed):** ",
+    paste(reverse_upright, collapse = ", "), "\n\n", sep = "")
+
+cat("## Cards Drawn\n\n")
+for (i in seq_len(nrow(draw))) {
+  row <- draw[i, ]
+  link <- if (is.na(row$guide_url) || row$guide_url == "") {
+    "No guide link available"
+  } else {
+    paste0("[Learn more](", row$guide_url, ")")
+  }
+  cat("- **", row$position, ":** ", row$card_name, " (", row$orientation, ") - ",
+      link, "\n", sep = "")
+}
+
+cat("\n## Reading\n\n")
+cat(final_reading, "\n")
+```
+
+**AI STATEMENT: The readings are generated by a tarot-specific trained google.gemma-4-31B-it model. Additionally Claude Haiku 5.5 was used to debug the coding workflow and to generate better designed prompt for the tarot-trained local model.**
